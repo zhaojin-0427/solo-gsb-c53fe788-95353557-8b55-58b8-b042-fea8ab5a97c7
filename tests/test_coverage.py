@@ -446,6 +446,152 @@ def test_unsupported_keyword_in_oneof_branch(client):
     assert doc["rows"][1]["outcome"] == "covered"
 
 
+
+
+# ============================================================== 失败分支命中污染
+def _body_post_spec(schema):
+    """/p POST：JSON 请求体 + 无实体 200 响应。"""
+    return _spec({"/p": {"post": {
+        "requestBody": {"content": {"application/json":
+                                    {"schema": schema}}},
+        "responses": {"200": {"description": "d"}}}}})
+
+
+def _body_response_spec(schema):
+    """/p POST：无请求体 + JSON 响应体 200。"""
+    return _spec({"/p": {"post": {
+        "responses": {"200": {"description": "d", "content": {
+            "application/json": {"schema": schema}}}}}}})
+
+
+def _body_call(body):
+    return {"method": "POST", "path": "/p",
+            "request": {"media_type": "application/json", "body": body},
+            "response": {"status": 200}}
+
+
+def _response_call(body):
+    return {"method": "POST", "path": "/p", "request": {},
+            "response": {"status": 200, "media_type": "application/json",
+                         "body": body}}
+
+
+def _fail_branch_with_not():
+    # 因缺少必填属性 missing 而确定失败，但同时含未支持 not
+    return {"type": "object", "required": ["missing"],
+            "not": {"const": "x"},
+            "properties": {"missing": {"type": "string"}}}
+
+
+def _pass_branch():
+    return {"type": "object", "required": ["a"],
+            "properties": {"a": {"type": "string"}}}
+
+
+def test_dead_hit_on_failed_branch_oneof_is_covered(client):
+    # 一支确定通过、另一支确定失败（缺必填）但含未支持 not：not 命中是
+    # 死命中，不可能翻案已知失败，oneOf「恰好一个」成立 → 覆盖计格。
+    schema = {"oneOf": [_pass_branch(), _fail_branch_with_not()]}
+    aid = _analysis_from_docs(client, _body_post_spec(schema))
+    doc = _upload(client, aid, "baseline", [_body_call({"a": "v"})]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "covered"
+    assert row["reasons"] == []
+    assert row["cell"] == "200|(no content)"
+    assert doc["summary"]["cells_covered"] == 1
+    assert doc["summary"]["calls_covered"] == 1
+    assert doc["summary"]["calls_undetermined"] == 0
+
+
+def test_dead_hit_on_failed_branch_anyof_is_covered(client):
+    schema = {"anyOf": [_pass_branch(), _fail_branch_with_not()]}
+    aid = _analysis_from_docs(client, _body_post_spec(schema))
+    doc = _upload(client, aid, "baseline", [_body_call({"a": "v"})]).json()
+    assert doc["rows"][0]["outcome"] == "covered"
+    assert doc["summary"]["cells_covered"] == 1
+
+
+def test_dead_hit_does_not_pollute_parent_property(client):
+    # 回归（核心）：组合位于父属性 box 之下时，失败分支的 not 死命中经
+    # 父属性汇总仍不得把应覆盖行判为无法判定 / 留下缺口。
+    schema = {"type": "object", "required": ["box"],
+              "properties": {"box": {"oneOf": [
+                  _pass_branch(), _fail_branch_with_not()]}}}
+    aid = _analysis_from_docs(client, _body_post_spec(schema))
+    doc = _upload(client, aid, "baseline",
+                  [_body_call({"box": {"a": "v"}})]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "covered"
+    assert row["reasons"] == []
+    assert doc["summary"]["cells_covered"] == 1
+    assert doc["operations"][0]["gaps"] == []
+
+
+def test_dead_hit_response_body_and_saved_export_consistent(client):
+    schema = {"type": "object", "required": ["box"],
+              "properties": {"box": {"anyOf": [
+                  _pass_branch(), _fail_branch_with_not()]}}}
+    aid = _analysis_from_docs(client, _body_response_spec(schema))
+    doc = _upload(client, aid, "baseline",
+                  [_response_call({"box": {"a": "v"}})]).json()
+    assert doc["rows"][0]["outcome"] == "covered"
+    assert doc["summary"]["cells_covered"] == 1
+    # 保存查询、侧确定性导出、主报告内嵌三处逐行一致
+    got = client.get(
+        f"/api/analyses/{aid}/coverage/baseline").json()
+    assert got["rows"] == doc["rows"]
+    exported = json.loads(client.get(
+        f"/api/analyses/{aid}/coverage/baseline/export").content)
+    assert exported["rows"] == doc["rows"]
+    assert exported["summary"] == doc["summary"]
+    assert exported["operations"] == doc["operations"]
+    main = json.loads(client.get(
+        f"/api/analyses/{aid}/export").content)
+    assert main["call_coverage"]["baseline"]["rows"] == doc["rows"]
+
+
+def test_dead_hit_inside_array_items_and_deep_nesting(client):
+    schema = {"type": "array", "items": {"oneOf": [
+        _pass_branch(), _fail_branch_with_not()]}}
+    aid = _analysis_from_docs(client, _body_post_spec(schema))
+    doc = _upload(client, aid, "baseline",
+                  [_body_call([{"a": "v"}, {"a": "w"}])]).json()
+    assert doc["rows"][0]["outcome"] == "covered"
+
+
+def test_oneof_pass_plus_failed_branch_with_not_and_pending_sibling(client):
+    # 一支确定通过、一支确定失败（带 not）、一支待定（pattern）→
+    # oneOf 仍无法判定，但原因只含待定分支的 pattern，不含死命中 not。
+    pending_branch = {"type": "object", "required": ["a"],
+                      "properties": {"a": {"type": "string",
+                                           "pattern": "^a"}}}
+    schema = {"oneOf": [_pass_branch(), _fail_branch_with_not(),
+                        pending_branch]}
+    aid = _analysis_from_docs(client, _body_post_spec(schema))
+    doc = _upload(client, aid, "baseline",
+                  [_body_call({"a": "abc"})]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    joined = " ".join(row["reasons"])
+    assert "pattern" in joined
+    assert "not" not in joined
+    assert doc["summary"]["cells_covered"] == 0
+
+
+def test_same_level_known_failure_not_masked_when_dead_hits_present(client):
+    # 同层另一属性 n 已知类型失败时，即使 kind 的 oneOf 一支确定通过，
+    # 失败也不能被掩盖。
+    schema = {"type": "object", "required": ["kind", "n"],
+              "properties": {
+                  "kind": {"oneOf": [
+                      {"const": "x"},
+                      {"type": "string", "minLength": 5, "not": {}}]},
+                  "n": {"type": "integer"}}}
+    aid = _analysis_from_docs(client, _body_post_spec(schema))
+    doc = _upload(client, aid, "baseline",
+                  [_body_call({"kind": "x", "n": "not-an-int"})]).json()
+    assert doc["rows"][0]["outcome"] == "validation_failed"
+    assert any("/n" in x for x in doc["rows"][0]["reasons"])
 # ============================================================== 组合分支三态裁决
 def _branch_spec(kind):
     """一个分支确定通过、另一个含 pattern 仍可能通过的组合 schema。"""

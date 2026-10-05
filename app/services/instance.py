@@ -129,6 +129,14 @@ def assess(node: SchemaNode, value: Any, *, reenter=None) -> Assessment:
     combinator branch already passes* (e.g. ``anyOf`` with one definite
     pass). The combinator itself still follows exactly-one (``oneOf``) /
     at-least-one (``anyOf``) semantics.
+
+    Pending hits travel upward only from genuinely **PENDING** branches /
+    children. A branch whose known constraints already fail (e.g. it misses
+    a required property but also hosts an unsupported ``not``) is FAIL no
+    matter what the unresolved keyword decides — stricter constraints can
+    only reject more — so that hit is *dead*: it neither enters the
+    combinator verdict nor rolls up into the parent, and cannot turn an
+    otherwise-covered value into PENDING / a gap.
     """
     return _assess(node, value, path="", depth=0,
                    mode="coverage", reenter=reenter, visited=frozenset(),
@@ -200,16 +208,26 @@ def _assess(node: SchemaNode, value: Any, *, path: str, depth: int,
 
     def absorb(result: Assessment) -> None:
         """Fold a child verdict in: FAIL dominates; otherwise PENDING sticks;
-        hits/errors are collected for location reporting."""
+        hits/errors are collected for location reporting.
+
+        Only **pending** hits can still change the combined/parent verdict:
+        a hit carried by a definitively FAILING child (e.g. a branch that
+        misses a required property but also hosts an unsupported ``not``) is
+        *dead* — the known failure can never be overturned, and a strict
+        constraint would only reject more. Propagating such a hit up would
+        pollute an otherwise-covered value into PENDING, so FAIL children's
+        hits are deliberately dropped here."""
         nonlocal child_state
+        if result.state == TRI_FAIL:
+            child_state = TRI_FAIL
+            errors.extend(result.errors)
+            return
         for h in result.hits:
             if h not in hits:
                 hits.append(h)
         if result.errors:
             errors.extend(result.errors)
-        if result.state == TRI_FAIL:
-            child_state = TRI_FAIL
-        elif result.state == TRI_PENDING and child_state != TRI_FAIL:
+        if result.state == TRI_PENDING and child_state != TRI_FAIL:
             child_state = TRI_PENDING
 
     if not type_failed and value is not None:
@@ -340,6 +358,9 @@ def _assess(node: SchemaNode, value: Any, *, path: str, depth: int,
     # properties.child 等触达循环 / 不可解析节点 / 未支持关键字）即使
     # oneOf/anyOf 组合确定通过，也必须保留 PENDING 并报告模式位置，不得
     # 直接把组合结论当作节点结论而误计覆盖格。
+    # 不变量：只有**待定**命中才会向上传播——确定失败子节点 / 分支上的
+    # 未决命中（如该分支既缺必填属性又含未支持 not）是死命中，不能把
+    # 已确定通过的组合或父属性污染成无法判定（见 absorb / _combine）。
     facet_failed = bool(errors) or child_state == TRI_FAIL
     facet_pending = child_state == TRI_PENDING or bool(hits)
 
@@ -408,13 +429,19 @@ def _revisit(loc, value, path, reenter, visited, reentries):
 def _replay_branch_state(node: SchemaNode, value: Any, depth: int) -> str:
     """Old replay branch classification: undecidable nodes / unsupported
     keywords reached by the value make the branch ``undecided``; otherwise
-    known-constraint errors => ``fail``, clean => ``pass``."""
+    known-constraint errors => ``fail``, clean => ``pass``.
+
+    State-first: a branch whose *known* constraints fail is ``fail`` even
+    when the value also touches a cycle / unsupported keyword on that same
+    branch — those cannot overturn a known failure."""
     r = _assess(node, value, path="", depth=depth + 1,
                 mode="coverage", reenter=None, visited=frozenset(),
                 reentries=0)
-    if r.hits:
-        return "undecided"
-    return "fail" if r.errors else "pass"
+    if r.state == TRI_FAIL:
+        return "fail"
+    if r.state == TRI_PASS:
+        return "pass"
+    return "undecided"
 
 
 def _combine(branches, value, path, reenter, visited, reentries,
@@ -422,19 +449,26 @@ def _combine(branches, value, path, reenter, visited, reentries,
     """oneOf（exactly_one=True，恰好一个分支通过）/ anyOf（至少一个）。
 
     分支状态三态：确定通过 / 确定失败 / 待定。已知约束失败的分支不会
-    因为触达循环/未支持约束而翻案——失败优先。
+    因为触达循环/未支持约束而翻案——失败优先，该分支携带的未决命中
+    （例如同时含缺少必填属性与未支持 ``not`` 的分支）是**死命中**，
+    不可能再改变组合结论，因此只收集仍为**待定**的分支命中，避免把
+    已经确定通过的组合污染成无法判定。
     """
-    states: list[str] = []
-    errors: list[str] = []
-    hits: list = []
+    results = []
     for b in branches:
-        r = _assess(b, value, path=path, depth=0,
-                    mode="coverage", reenter=reenter, visited=visited,
-                    reentries=reentries)
-        states.append(r.state)
-        for h in r.hits:
-            if h not in hits:
-                hits.append(h)
+        results.append(_assess(b, value, path=path, depth=0,
+                               mode="coverage", reenter=reenter,
+                               visited=visited, reentries=reentries))
+    states = [r.state for r in results]
+    # 仅待定分支的命中仍可能影响组合结论；确定失败分支的命中丢弃。
+    live_hits: list = []
+    for r in results:
+        if r.state == TRI_PENDING:
+            for h in r.hits:
+                if h not in live_hits:
+                    live_hits.append(h)
+    errors: list[str] = []
+    for r in results:
         errors.extend(r.errors)
     n_pass = states.count(TRI_PASS)
     n_pending = states.count(TRI_PENDING)
@@ -444,28 +478,29 @@ def _combine(branches, value, path, reenter, visited, reentries,
         if n_pass >= 2:
             return Assessment(TRI_FAIL,
                               [f"{path or '#'}: 同时满足 oneOf 的 {n_pass} "
-                               "个分支（要求恰好一个）"] + errors, hits)
+                               "个分支（要求恰好一个）"] + errors, [])
         # 一个确定通过 + 其余分支仍可能通过（待定）→ 是否恰好一个无定论
         if n_pass == 1 and n_pending > 0:
-            return Assessment(TRI_PENDING, [], hits)
-        # 一个确定通过且其余确定失败 → 通过
+            return Assessment(TRI_PENDING, [], live_hits)
+        # 一个确定通过且其余确定失败 → 通过（死命中不污染）
         if n_pass == 1:
-            return Assessment(TRI_PASS, [], hits)
+            return Assessment(TRI_PASS, [], [])
         # 没有确定通过：所有分支确定失败 → 失败；否则待定
         if n_pending == 0:
             return Assessment(TRI_FAIL,
                               [f"{path or '#'}: 不满足 oneOf 的任何分支"]
-                              + errors, hits)
-        return Assessment(TRI_PENDING, [], hits)
+                              + errors, [])
+        return Assessment(TRI_PENDING, [], live_hits)
 
-    # anyOf：至少一个确定通过即可；否则有待定即待定；全失败才失败
+    # anyOf：至少一个确定通过即可（待定分支不影响）；否则有待定即待定；
+    # 全失败才失败
     if n_pass >= 1:
-        return Assessment(TRI_PASS, [], hits)
+        return Assessment(TRI_PASS, [], [])
     if n_pending > 0:
-        return Assessment(TRI_PENDING, [], hits)
+        return Assessment(TRI_PENDING, [], live_hits)
     return Assessment(TRI_FAIL,
                       [f"{path or '#'}: 不满足 anyOf 的任何分支"]
-                      + errors, hits)
+                      + errors, [])
 
 
 # Unsupported keyword -> JSON types it constrains. Keywords missing from this
