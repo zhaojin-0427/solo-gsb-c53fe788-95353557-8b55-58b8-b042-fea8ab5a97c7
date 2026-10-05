@@ -517,6 +517,122 @@ def test_oneof_two_definite_passes_fail_validation(client):
     assert doc["summary"]["cells_covered"] == 0
 
 
+# ============================================================== 分支命中污染
+def _nested_branch_spec(kind, branch_b, *, in_response=False):
+    """嵌套属性的组合：对象属性 x 的 schema 为 oneOf/anyOf，
+    分支 0 确定通过，分支 1 由参数给出。"""
+    branch_pass = {"type": "object", "required": ["kind"],
+                   "properties": {"kind": {"const": "a"}}}
+    prop_schema = {kind: [branch_pass, branch_b]}
+    body_schema = {"type": "object", "properties": {"x": prop_schema}}
+    op = {"responses": {"200": {"description": "d"}}}
+    if in_response:
+        op["responses"]["200"]["content"] = {
+            "application/json": {"schema": body_schema}}
+    else:
+        op["requestBody"] = {
+            "content": {"application/json": {"schema": body_schema}}}
+    return _spec({"/p": {"post": op}})
+
+
+# 分支 1：缺少必填属性确定失败，同时含未支持的 not
+_FAIL_WITH_NOT = {"type": "object", "required": ["other"],
+                  "not": {"required": ["kind"]},
+                  "properties": {"other": {"type": "string"}}}
+# 分支 1：已知约束全过但含 pattern → 待定
+_PENDING_PATTERN = {"type": "object", "required": ["kind"],
+                    "properties": {"kind": {"const": "a"},
+                                   "v": {"type": "string",
+                                         "pattern": "^a"}}}
+
+
+def _nested_call(in_response=False):
+    call = {"method": "POST", "path": "/p",
+            "response": {"status": 200}}
+    if in_response:
+        call["response"]["media_type"] = "application/json"
+        call["response"]["body"] = {"x": {"kind": "a"}}
+    else:
+        call["request"] = {"media_type": "application/json",
+                           "body": {"x": {"kind": "a"}}}
+    return call
+
+
+def test_failed_branch_not_hit_does_not_pollute_nested_oneof(client):
+    # 回归：嵌套属性 oneOf 一支确定通过、另一支因缺少必填属性确定失败
+    # （虽含未支持的 not）→ 记 covered 并计格；失败分支的 not 命中不得
+    # 经组合与父属性汇总把行污染成无法判定。
+    aid = _analysis_from_docs(
+        client, _nested_branch_spec("oneOf", _FAIL_WITH_NOT))
+    doc = _upload(client, aid, "baseline", [_nested_call()]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "covered"
+    assert row["cell"] == "200|(no content)"
+    assert doc["summary"]["cells_covered"] == 1
+    assert doc["summary"]["calls_undetermined"] == 0
+    op = doc["operations"][0]
+    assert op["gaps"] == []
+    # 保存查询与确定性导出逐行一致
+    got = client.get(f"/api/analyses/{aid}/coverage/baseline").json()
+    assert got["rows"] == doc["rows"]
+    exported = json.loads(client.get(
+        f"/api/analyses/{aid}/coverage/baseline/export").content)
+    assert exported["rows"] == doc["rows"]
+    assert exported["summary"] == doc["summary"]
+
+
+def test_failed_branch_not_hit_does_not_pollute_nested_anyof(client):
+    # 同上，anyOf 版本
+    aid = _analysis_from_docs(
+        client, _nested_branch_spec("anyOf", _FAIL_WITH_NOT))
+    doc = _upload(client, aid, "baseline", [_nested_call()]).json()
+    assert doc["rows"][0]["outcome"] == "covered"
+    assert doc["summary"]["cells_covered"] == 1
+    assert doc["operations"][0]["gaps"] == []
+
+
+def test_failed_branch_not_hit_does_not_pollute_response_body(client):
+    # 响应体嵌套属性的 oneOf 同样不被失败分支的 not 命中污染
+    aid = _analysis_from_docs(
+        client, _nested_branch_spec("oneOf", _FAIL_WITH_NOT,
+                                    in_response=True))
+    doc = _upload(client, aid, "baseline",
+                  [_nested_call(in_response=True)]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "covered"
+    assert row["cell"] == "200|application/json"
+    assert doc["summary"]["cells_covered"] == 1
+
+
+def test_nested_anyof_pass_plus_pending_branch_is_covered(client):
+    # 嵌套 anyOf 一过一待定：一个确定通过即可计格——待定分支的命中
+    # 已不可能改变「至少一个」的组合结论，不向父属性传播
+    aid = _analysis_from_docs(
+        client, _nested_branch_spec("anyOf", _PENDING_PATTERN))
+    call = _nested_call()
+    call["request"]["body"] = {"x": {"kind": "a", "v": "abc"}}
+    doc = _upload(client, aid, "baseline", [call]).json()
+    assert doc["rows"][0]["outcome"] == "covered"
+    assert doc["summary"]["cells_covered"] == 1
+
+
+def test_nested_oneof_pass_plus_pending_branch_is_undetermined(client):
+    # 嵌套 oneOf 一过一待定：是否「恰好一个」无定论 → 无法判定、不计格，
+    # 且列出待定分支的未决命中（该命中仍可能改变组合结论）
+    aid = _analysis_from_docs(
+        client, _nested_branch_spec("oneOf", _PENDING_PATTERN))
+    call = _nested_call()
+    call["request"]["body"] = {"x": {"kind": "a", "v": "abc"}}
+    doc = _upload(client, aid, "baseline", [call]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    assert any("pattern" in x and "oneOf/1" in x for x in row["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+    assert doc["summary"]["calls_undetermined"] == 1
+    op = doc["operations"][0]
+    assert {c["key"] for c in op["gaps"]} == {"200|(no content)"}
+
+
 def test_oneof_pending_branch_in_response_body(client):
     # 响应体中的 oneOf 同样按三态裁决
     schema = {"oneOf": [

@@ -128,7 +128,14 @@ def assess(node: SchemaNode, value: Any, *, reenter=None) -> Assessment:
     to the value type — stays PENDING with locations reported, *even when a
     combinator branch already passes* (e.g. ``anyOf`` with one definite
     pass). The combinator itself still follows exactly-one (``oneOf``) /
-    at-least-one (``anyOf``) semantics.
+    at-least-one (``anyOf``) semantics, and only branch hits that can
+    still change the combination conclusion propagate upward: hits inside
+    a definitely-failed branch (e.g. an unsupported ``not`` next to a
+    missing required property) are discarded, as are pending-branch hits
+    once ``anyOf`` already has a definite pass — so a nested property's
+    combinator never poisons its parent into PENDING when the combination
+    itself is settled. A genuinely pending branch still blocks ``oneOf``
+    (exactly-one undecidable) while ``anyOf`` may count the cell.
     """
     return _assess(node, value, path="", depth=0,
                    mode="coverage", reenter=reenter, visited=frozenset(),
@@ -423,18 +430,30 @@ def _combine(branches, value, path, reenter, visited, reentries,
 
     分支状态三态：确定通过 / 确定失败 / 待定。已知约束失败的分支不会
     因为触达循环/未支持约束而翻案——失败优先。
+
+    未决命中（未支持关键字、循环、不可解析节点）只在**仍可能改变组合
+    结论**时才向上传递：
+
+    * 确定失败分支的命中（例如分支因缺少必填属性确定失败、同时含未
+      支持的 ``not``）不可能翻案，丢弃——否则它会经组合与父属性汇总
+      把本应覆盖的行污染成无法判定；
+    * 待定分支的命中只有在组合结论本身为待定时才相关：``oneOf`` 一
+      过一待定（是否“恰好一个”无定论）或零通过有特定时保留并上报；
+      ``anyOf`` 已有一个确定通过时，其余分支无论待定与否都不可能改
+      变“至少一个”的成立，命中一并丢弃（可计覆盖格）。
     """
     states: list[str] = []
     errors: list[str] = []
-    hits: list = []
+    pending_hits: list = []
     for b in branches:
         r = _assess(b, value, path=path, depth=0,
                     mode="coverage", reenter=reenter, visited=visited,
                     reentries=reentries)
         states.append(r.state)
-        for h in r.hits:
-            if h not in hits:
-                hits.append(h)
+        if r.state == TRI_PENDING:
+            for h in r.hits:
+                if h not in pending_hits:
+                    pending_hits.append(h)
         errors.extend(r.errors)
     n_pass = states.count(TRI_PASS)
     n_pending = states.count(TRI_PENDING)
@@ -444,28 +463,31 @@ def _combine(branches, value, path, reenter, visited, reentries,
         if n_pass >= 2:
             return Assessment(TRI_FAIL,
                               [f"{path or '#'}: 同时满足 oneOf 的 {n_pass} "
-                               "个分支（要求恰好一个）"] + errors, hits)
-        # 一个确定通过 + 其余分支仍可能通过（待定）→ 是否恰好一个无定论
+                               "个分支（要求恰好一个）"] + errors)
+        # 一个确定通过 + 其余分支仍可能通过（待定）→ 是否恰好一个无定论：
+        # 待定分支的未决命中仍可能改变结论，保留并上报（不计覆盖格）
         if n_pass == 1 and n_pending > 0:
-            return Assessment(TRI_PENDING, [], hits)
-        # 一个确定通过且其余确定失败 → 通过
+            return Assessment(TRI_PENDING, [], pending_hits)
+        # 一个确定通过且其余确定失败 → 通过（失败分支的未决命中不影响结论）
         if n_pass == 1:
-            return Assessment(TRI_PASS, [], hits)
+            return Assessment(TRI_PASS)
         # 没有确定通过：所有分支确定失败 → 失败；否则待定
         if n_pending == 0:
             return Assessment(TRI_FAIL,
                               [f"{path or '#'}: 不满足 oneOf 的任何分支"]
-                              + errors, hits)
-        return Assessment(TRI_PENDING, [], hits)
+                              + errors)
+        return Assessment(TRI_PENDING, [], pending_hits)
 
-    # anyOf：至少一个确定通过即可；否则有待定即待定；全失败才失败
+    # anyOf：至少一个确定通过即成立——其余分支的未决命中已不可能改变
+    # 组合结论，不再向上传播（可计覆盖格）；没有确定通过、仅剩待定
+    # 分支时才记待定并上报其命中；全失败才失败
     if n_pass >= 1:
-        return Assessment(TRI_PASS, [], hits)
+        return Assessment(TRI_PASS)
     if n_pending > 0:
-        return Assessment(TRI_PENDING, [], hits)
+        return Assessment(TRI_PENDING, [], pending_hits)
     return Assessment(TRI_FAIL,
                       [f"{path or '#'}: 不满足 anyOf 的任何分支"]
-                      + errors, hits)
+                      + errors)
 
 
 # Unsupported keyword -> JSON types it constrains. Keywords missing from this
